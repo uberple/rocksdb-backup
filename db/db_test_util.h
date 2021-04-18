@@ -23,7 +23,6 @@
 
 #include "db/db_impl/db_impl.h"
 #include "db/dbformat.h"
-#include "env/mock_env.h"
 #include "file/filename.h"
 #include "memtable/hash_linklist_rep.h"
 #include "rocksdb/cache.h"
@@ -40,7 +39,6 @@
 #include "rocksdb/utilities/checkpoint.h"
 #include "table/mock_table.h"
 #include "table/scoped_arena_iterator.h"
-#include "test_util/mock_time_env.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "util/cast_util.h"
@@ -50,6 +48,7 @@
 #include "utilities/merge_operators.h"
 
 namespace ROCKSDB_NAMESPACE {
+class MockEnv;
 
 namespace anon {
 class AtomicCounter {
@@ -230,6 +229,11 @@ class SpecialEnv : public EnvWrapper {
           return base_->Append(data);
         }
       }
+      Status Append(
+          const Slice& data,
+          const DataVerificationInfo& /* verification_info */) override {
+        return Append(data);
+      }
       Status PositionedAppend(const Slice& data, uint64_t offset) override {
         if (env_->table_write_callback_) {
           (*env_->table_write_callback_)();
@@ -243,6 +247,11 @@ class SpecialEnv : public EnvWrapper {
           env_->bytes_written_ += data.size();
           return base_->PositionedAppend(data, offset);
         }
+      }
+      Status PositionedAppend(
+          const Slice& data, uint64_t offset,
+          const DataVerificationInfo& /* verification_info */) override {
+        return PositionedAppend(data, offset);
       }
       Status Truncate(uint64_t size) override { return base_->Truncate(size); }
       Status RangeSync(uint64_t offset, uint64_t nbytes) override {
@@ -306,6 +315,12 @@ class SpecialEnv : public EnvWrapper {
           return base_->Append(data);
         }
       }
+      Status Append(
+          const Slice& data,
+          const DataVerificationInfo& /*verification_info*/) override {
+        return Append(data);
+      }
+
       Status Truncate(uint64_t size) override { return base_->Truncate(size); }
       Status Close() override { return base_->Close(); }
       Status Flush() override { return base_->Flush(); }
@@ -357,6 +372,11 @@ class SpecialEnv : public EnvWrapper {
 #endif
         return s;
       }
+      Status Append(
+          const Slice& data,
+          const DataVerificationInfo& /* verification_info */) override {
+        return Append(data);
+      }
       Status Truncate(uint64_t size) override { return base_->Truncate(size); }
       Status Close() override {
 // SyncPoint is not supported in Released Windows Mode.
@@ -395,6 +415,11 @@ class SpecialEnv : public EnvWrapper {
       OtherFile(SpecialEnv* env, std::unique_ptr<WritableFile>&& b)
           : env_(env), base_(std::move(b)) {}
       Status Append(const Slice& data) override { return base_->Append(data); }
+      Status Append(
+          const Slice& data,
+          const DataVerificationInfo& /*verification_info*/) override {
+        return Append(data);
+      }
       Status Truncate(uint64_t size) override { return base_->Truncate(size); }
       Status Close() override { return base_->Close(); }
       Status Flush() override { return base_->Flush(); }
@@ -736,6 +761,17 @@ class OnFileDeletionListener : public EventListener {
   size_t matched_count_;
   std::string expected_file_name_;
 };
+
+class FlushCounterListener : public EventListener {
+ public:
+  std::atomic<int> count{0};
+  std::atomic<FlushReason> expected_flush_reason{FlushReason::kOthers};
+
+  void OnFlushBegin(DB* /*db*/, const FlushJobInfo& flush_job_info) override {
+    count++;
+    ASSERT_EQ(expected_flush_reason.load(), flush_job_info.flush_reason);
+  }
+};
 #endif
 
 // A test merge operator mimics put but also fails if one of merge operands is
@@ -949,10 +985,13 @@ class DBTestBase : public testing::Test {
                          const anon::OptionsOverride& options_override =
                              anon::OptionsOverride()) const;
 
-  static Options GetDefaultOptions();
+  Options GetDefaultOptions() const;
 
-  Options GetOptions(int option_config,
-                     const Options& default_options = GetDefaultOptions(),
+  Options GetOptions(int option_config) const {
+    return GetOptions(option_config, GetDefaultOptions());
+  }
+
+  Options GetOptions(int option_config, const Options& default_options,
                      const anon::OptionsOverride& options_override =
                          anon::OptionsOverride()) const;
 
@@ -1062,12 +1101,20 @@ class DBTestBase : public testing::Test {
   int TotalTableFiles(int cf = 0, int levels = -1);
 #endif  // ROCKSDB_LITE
 
+  std::vector<uint64_t> GetBlobFileNumbers();
+
   // Return spread of files per level
   std::string FilesPerLevel(int cf = 0);
 
   size_t CountFiles();
 
-  uint64_t Size(const Slice& start, const Slice& limit, int cf = 0);
+  Status CountFiles(size_t* count);
+
+  Status Size(const Slice& start, const Slice& limit, uint64_t* size) {
+    return Size(start, limit, 0, size);
+  }
+
+  Status Size(const Slice& start, const Slice& limit, int cf, uint64_t* size);
 
   void Compact(int cf, const Slice& start, const Slice& limit,
                uint32_t target_path_id);
@@ -1145,8 +1192,9 @@ class DBTestBase : public testing::Test {
   void CopyFile(const std::string& source, const std::string& destination,
                 uint64_t size = 0);
 
-  Status GetAllSSTFiles(std::unordered_map<std::string, uint64_t>* sst_files,
-                        uint64_t* total_size = nullptr);
+  Status GetAllDataFiles(const FileType file_type,
+                         std::unordered_map<std::string, uint64_t>* sst_files,
+                         uint64_t* total_size = nullptr);
 
   std::vector<std::uint64_t> ListTableFiles(Env* env, const std::string& path);
 
