@@ -393,6 +393,10 @@ class SpecialEnv : public EnvWrapper {
       Status Flush() override { return base_->Flush(); }
       Status Sync() override {
         ++env_->sync_counter_;
+        if (env_->corrupt_in_sync_) {
+          Append(std::string(33000, ' '));
+          return Status::IOError("Ingested Sync Failure");
+        }
         if (env_->skip_fsync_) {
           return Status::OK();
         } else {
@@ -439,6 +443,11 @@ class SpecialEnv : public EnvWrapper {
       SpecialEnv* env_;
       std::unique_ptr<WritableFile> base_;
     };
+
+    if (no_file_overwrite_.load(std::memory_order_acquire) &&
+        target()->FileExists(f).ok()) {
+      return Status::NotSupported("SpecialEnv::no_file_overwrite_ is true.");
+    }
 
     if (non_writeable_rate_.load(std::memory_order_acquire) > 0) {
       uint32_t random_number;
@@ -687,6 +696,9 @@ class SpecialEnv : public EnvWrapper {
   // Slow down every log write, in micro-seconds.
   std::atomic<int> log_write_slowdown_;
 
+  // If true, returns Status::NotSupported for file overwrite.
+  std::atomic<bool> no_file_overwrite_;
+
   // Number of WAL files that are still open for write.
   std::atomic<int> num_open_wal_file_;
 
@@ -708,6 +720,9 @@ class SpecialEnv : public EnvWrapper {
 
   // If true, all fsync to files and directories are skipped.
   bool skip_fsync_ = false;
+
+  // If true, ingest the corruption to file during sync.
+  bool corrupt_in_sync_ = false;
 
   std::atomic<uint32_t> non_writeable_rate_;
 
