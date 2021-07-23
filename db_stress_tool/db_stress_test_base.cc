@@ -21,17 +21,37 @@
 #include "utilities/fault_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+std::shared_ptr<const FilterPolicy> CreateFilterPolicy() {
+  if (FLAGS_bloom_bits < 0) {
+    return BlockBasedTableOptions().filter_policy;
+  }
+  const FilterPolicy* new_policy;
+  if (FLAGS_use_ribbon_filter) {
+    // Old and new API should be same
+    if (std::random_device()() & 1) {
+      new_policy = NewExperimentalRibbonFilterPolicy(FLAGS_bloom_bits);
+    } else {
+      new_policy = NewRibbonFilterPolicy(FLAGS_bloom_bits);
+    }
+  } else {
+    if (FLAGS_use_block_based_filter) {
+      new_policy = NewBloomFilterPolicy(FLAGS_bloom_bits, true);
+    } else {
+      new_policy = NewBloomFilterPolicy(FLAGS_bloom_bits, false);
+    }
+  }
+  return std::shared_ptr<const FilterPolicy>(new_policy);
+}
+
+}  // namespace
+
 StressTest::StressTest()
     : cache_(NewCache(FLAGS_cache_size)),
       compressed_cache_(NewLRUCache(FLAGS_compressed_cache_size)),
-      filter_policy_(
-          FLAGS_bloom_bits >= 0
-              ? FLAGS_use_ribbon_filter
-                    ? NewExperimentalRibbonFilterPolicy(FLAGS_bloom_bits)
-                : FLAGS_use_block_based_filter
-                    ? NewBloomFilterPolicy(FLAGS_bloom_bits, true)
-                    : NewBloomFilterPolicy(FLAGS_bloom_bits, false)
-              : nullptr),
+      filter_policy_(CreateFilterPolicy()),
       db_(nullptr),
 #ifndef ROCKSDB_LITE
       txn_db_(nullptr),
@@ -2083,13 +2103,16 @@ void StressTest::PrintEnv() const {
 
   fprintf(stdout, "Memtablerep               : %s\n", memtablerep);
 
-  fprintf(stdout, "Test kill odd             : %d\n", rocksdb_kill_odds);
-  if (!rocksdb_kill_exclude_prefixes.empty()) {
+#ifndef NDEBUG
+  KillPoint* kp = KillPoint::GetInstance();
+  fprintf(stdout, "Test kill odd             : %d\n", kp->rocksdb_kill_odds);
+  if (!kp->rocksdb_kill_exclude_prefixes.empty()) {
     fprintf(stdout, "Skipping kill points prefixes:\n");
-    for (auto& p : rocksdb_kill_exclude_prefixes) {
+    for (auto& p : kp->rocksdb_kill_exclude_prefixes) {
       fprintf(stdout, "  %s\n", p.c_str());
     }
   }
+#endif
   fprintf(stdout, "Periodic Compaction Secs  : %" PRIu64 "\n",
           FLAGS_periodic_compaction_seconds);
   fprintf(stdout, "Compaction TTL            : %" PRIu64 "\n",
@@ -2465,6 +2488,16 @@ void StressTest::Open() {
 #ifndef NDEBUG
         if (ingest_meta_error) {
           fault_fs_guard->DisableMetadataWriteErrorInjection();
+          if (s.ok()) {
+            // Ingested errors might happen in background compactions. We
+            // wait for all compactions to finish to make sure DB is in
+            // clean state before executing queries.
+            s = static_cast_with_check<DBImpl>(db_->GetRootDB())
+                    ->TEST_WaitForCompact(true);
+            if (!s.ok()) {
+              delete db_;
+            }
+          }
           if (!s.ok()) {
             // After failure to opening a DB due to IO error, retry should
             // successfully open the DB with correct data if no IO error shows

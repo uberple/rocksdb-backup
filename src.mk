@@ -1,10 +1,12 @@
 # These are the sources from which librocksdb.a is built:
 LIB_SOURCES =                                                   \
   cache/cache.cc                                                \
+  cache/cache_entry_roles.cc                                    \
   cache/clock_cache.cc                                          \
   cache/lru_cache.cc                                            \
   cache/sharded_cache.cc                                        \
   db/arena_wrapped_db_iter.cc                                   \
+  db/blob/blob_fetcher.cc                                       \
   db/blob/blob_file_addition.cc                                 \
   db/blob/blob_file_builder.cc                                  \
   db/blob/blob_file_cache.cc                                    \
@@ -318,6 +320,10 @@ MOCK_LIB_SOURCES =                                              \
 
 BENCH_LIB_SOURCES =                                             \
   tools/db_bench_tool.cc                                        \
+  tools/simulated_hybrid_file_system.cc                         \
+
+CACHE_BENCH_LIB_SOURCES =					\
+  cache/cache_bench_tool.cc                                     \
 
 STRESS_LIB_SOURCES =                                            \
   db_stress_tool/batched_ops_stress.cc                         \
@@ -383,10 +389,12 @@ TEST_MAIN_SOURCES =                                                     \
   db/blob/db_blob_index_test.cc                                         \
   db/column_family_test.cc                                              \
   db/compact_files_test.cc                                              \
+  db/compaction/clipping_iterator_test.cc                               \
   db/compaction/compaction_iterator_test.cc                             \
   db/compaction/compaction_job_test.cc                                  \
   db/compaction/compaction_job_stats_test.cc                            \
   db/compaction/compaction_picker_test.cc                               \
+  db/compaction/compaction_service_test.cc                              \
   db/comparator_db_test.cc                                              \
   db/corruption_test.cc                                                 \
   db/cuckoo_table_db_test.cc                                            \
@@ -424,6 +432,7 @@ TEST_MAIN_SOURCES =                                                     \
   db/db_universal_compaction_test.cc                                    \
   db/db_wal_test.cc                                                     \
   db/db_with_timestamp_compaction_test.cc                               \
+  db/db_write_buffer_manager_test.cc                                    \
   db/db_write_test.cc                                                   \
   db/dbformat_test.cc                                                   \
   db/deletefile_test.cc                                                 \

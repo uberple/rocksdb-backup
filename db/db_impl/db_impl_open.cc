@@ -1259,7 +1259,8 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
       // If there's no data in the WAL, or we flushed all the data, still
       // truncate the log file. If the process goes into a crash loop before
       // the file is deleted, the preallocated space will never get freed.
-      GetLogSizeAndMaybeTruncate(wal_numbers.back(), true, nullptr)
+      const bool truncate = !read_only;
+      GetLogSizeAndMaybeTruncate(wal_numbers.back(), truncate, nullptr)
           .PermitUncheckedError();
     }
   }
@@ -1292,7 +1293,7 @@ Status DBImpl::GetLogSizeAndMaybeTruncate(uint64_t wal_number, bool truncate,
       truncate_status = last_log->Close(IOOptions(), nullptr);
     }
     // Not a critical error if fail to truncate.
-    if (!truncate_status.ok()) {
+    if (!truncate_status.ok() && !truncate_status.IsNotSupported()) {
       ROCKS_LOG_WARN(immutable_db_options_.info_log,
                      "Failed to truncate log #%" PRIu64 ": %s", wal_number,
                      truncate_status.ToString().c_str());
@@ -1393,21 +1394,23 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
       }
 
       IOStatus io_s;
-      s = BuildTable(
-          dbname_, versions_.get(), immutable_db_options_, *cfd->ioptions(),
-          mutable_cf_options, file_options_for_compaction_, cfd->table_cache(),
-          iter.get(), std::move(range_del_iters), &meta, &blob_file_additions,
-          cfd->internal_comparator(), cfd->int_tbl_prop_collector_factories(),
-          cfd->GetID(), cfd->GetName(), snapshot_seqs,
-          earliest_write_conflict_snapshot, snapshot_checker,
+      TableBuilderOptions tboptions(
+          *cfd->ioptions(), mutable_cf_options, cfd->internal_comparator(),
+          cfd->int_tbl_prop_collector_factories(),
           GetCompressionFlush(*cfd->ioptions(), mutable_cf_options),
-          mutable_cf_options.compression_opts, paranoid_file_checks,
-          cfd->internal_stats(), TableFileCreationReason::kRecovery, &io_s,
-          io_tracer_, &event_logger_, job_id, Env::IO_HIGH,
-          nullptr /* table_properties */, 0 /* level */, current_time,
-          0 /* oldest_key_time */, write_hint, 0 /* file_creation_time */,
-          db_id_, db_session_id_, nullptr /*full_history_ts_low*/,
-          &blob_callback_);
+          mutable_cf_options.compression_opts, cfd->GetID(), cfd->GetName(),
+          0 /* level */, false /* is_bottommost */,
+          TableFileCreationReason::kRecovery, current_time,
+          0 /* oldest_key_time */, 0 /* file_creation_time */, db_id_,
+          db_session_id_, 0 /* target_file_size */, meta.fd.GetNumber());
+      s = BuildTable(
+          dbname_, versions_.get(), immutable_db_options_, tboptions,
+          file_options_for_compaction_, cfd->table_cache(), iter.get(),
+          std::move(range_del_iters), &meta, &blob_file_additions,
+          snapshot_seqs, earliest_write_conflict_snapshot, snapshot_checker,
+          paranoid_file_checks, cfd->internal_stats(), &io_s, io_tracer_,
+          &event_logger_, job_id, Env::IO_HIGH, nullptr /* table_properties */,
+          write_hint, nullptr /*full_history_ts_low*/, &blob_callback_);
       LogFlush(immutable_db_options_.info_log);
       ROCKS_LOG_DEBUG(immutable_db_options_.info_log,
                       "[%s] [WriteLevel0TableForRecovery]"
