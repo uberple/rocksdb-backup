@@ -253,8 +253,8 @@ Status DBImplSecondary::RecoverLogFiles(
                                          curr_log_num != log_number)) {
             const MutableCFOptions mutable_cf_options =
                 *cfd->GetLatestMutableCFOptions();
-            MemTable* new_mem =
-                cfd->ConstructNewMemtable(mutable_cf_options, seq_of_batch);
+            MemTable* new_mem = cfd->ConstructNewMemtable(
+                mutable_cf_options, seq_of_batch, log_number);
             cfd->mem()->SetNextLogNumber(log_number);
             cfd->imm()->Add(cfd->mem(), &job_context->memtables_to_free);
             new_mem->Ref();
@@ -767,6 +767,7 @@ Status DB::OpenAndCompact(
   compaction_input.db_options.env = override_options.env;
   compaction_input.db_options.file_checksum_gen_factory =
       override_options.file_checksum_gen_factory;
+  compaction_input.db_options.statistics = override_options.statistics;
   compaction_input.column_family.options.comparator =
       override_options.comparator;
   compaction_input.column_family.options.merge_operator =
