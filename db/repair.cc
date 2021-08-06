@@ -286,21 +286,15 @@ class Repairer {
     }
 
     // search wal_dir if user uses a customize wal_dir
-    bool same = false;
-    Status status = env_->AreFilesSame(db_options_.wal_dir, dbname_, &same);
-    if (status.IsNotSupported()) {
-      same = db_options_.wal_dir == dbname_;
-      status = Status::OK();
-    } else if (!status.ok()) {
-      return status;
-    }
-
+    bool same = immutable_db_options_.IsWalDirSameAsDBPath(dbname_);
     if (!same) {
-      to_search_paths.push_back(db_options_.wal_dir);
+      to_search_paths.push_back(immutable_db_options_.wal_dir);
     }
 
     for (size_t path_id = 0; path_id < to_search_paths.size(); path_id++) {
-      status = env_->GetChildren(to_search_paths[path_id], &filenames);
+      ROCKS_LOG_INFO(db_options_.info_log, "Searching path %s\n",
+                     to_search_paths[path_id].c_str());
+      Status status = env_->GetChildren(to_search_paths[path_id], &filenames);
       if (!status.ok()) {
         return status;
       }
@@ -337,10 +331,11 @@ class Repairer {
   }
 
   void ConvertLogFilesToTables() {
+    const auto& wal_dir = immutable_db_options_.GetWalDir();
     for (size_t i = 0; i < logs_.size(); i++) {
       // we should use LogFileName(wal_dir, logs_[i]) here. user might uses wal_dir option.
-      std::string logname = LogFileName(db_options_.wal_dir, logs_[i]);
-      Status status = ConvertLogToTable(logs_[i]);
+      std::string logname = LogFileName(wal_dir, logs_[i]);
+      Status status = ConvertLogToTable(wal_dir, logs_[i]);
       if (!status.ok()) {
         ROCKS_LOG_WARN(db_options_.info_log,
                        "Log #%" PRIu64 ": ignoring conversion error: %s",
@@ -350,7 +345,7 @@ class Repairer {
     }
   }
 
-  Status ConvertLogToTable(uint64_t log) {
+  Status ConvertLogToTable(const std::string& wal_dir, uint64_t log) {
     struct LogReporter : public log::Reader::Reporter {
       Env* env;
       std::shared_ptr<Logger> info_log;
@@ -363,7 +358,7 @@ class Repairer {
     };
 
     // Open the log file
-    std::string logname = LogFileName(db_options_.wal_dir, log);
+    std::string logname = LogFileName(wal_dir, log);
     const auto& fs = env_->GetFileSystem();
     std::unique_ptr<SequentialFileReader> lfile_reader;
     Status status = SequentialFileReader::Create(
@@ -388,7 +383,7 @@ class Repairer {
     // Initialize per-column family memtables
     for (auto* cfd : *vset_.GetColumnFamilySet()) {
       cfd->CreateNewMemtable(*cfd->GetLatestMutableCFOptions(),
-                             kMaxSequenceNumber, cfd->GetLogNumber());
+                             kMaxSequenceNumber);
     }
     auto cf_mems = new ColumnFamilyMemTablesImpl(vset_.GetColumnFamilySet());
 
@@ -586,6 +581,30 @@ class Repairer {
       ROCKS_LOG_INFO(db_options_.info_log, "Table #%" PRIu64 ": %d entries %s",
                      t->meta.fd.GetNumber(), counter,
                      status.ToString().c_str());
+    }
+    if (status.ok()) {
+      // XXX/FIXME: This is just basic, naive handling of range tombstones,
+      // like call to UpdateBoundariesForRange in builder.cc where we assume
+      // an SST file is a full sorted run. This probably needs the extra logic
+      // from compaction_job.cc around call to UpdateBoundariesForRange (to
+      // handle range tombstones extendingg beyond range of other entries).
+      ReadOptions ropts;
+      std::unique_ptr<FragmentedRangeTombstoneIterator> r_iter;
+      status = table_cache_->GetRangeTombstoneIterator(
+          ropts, cfd->internal_comparator(), t->meta, &r_iter);
+
+      if (r_iter) {
+        r_iter->SeekToFirst();
+
+        while (r_iter->Valid()) {
+          auto tombstone = r_iter->Tombstone();
+          auto kv = tombstone.Serialize();
+          t->meta.UpdateBoundariesForRange(
+              kv.first, tombstone.SerializeEndKey(), tombstone.seq_,
+              cfd->internal_comparator());
+          r_iter->Next();
+        }
+      }
     }
     return status;
   }

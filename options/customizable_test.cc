@@ -14,7 +14,7 @@
 #include <cstring>
 #include <unordered_map>
 
-#include "options/configurable_helper.h"
+#include "db/db_test_util.h"
 #include "options/options_helper.h"
 #include "options/options_parser.h"
 #include "rocksdb/convenience.h"
@@ -922,6 +922,29 @@ static int RegisterTestObjects(ObjectLibrary& library,
         guard->reset(new mock::MockTableFactory());
         return guard->get();
       });
+  library.Register<EventListener>(
+      OnFileDeletionListener::kClassName(),
+      [](const std::string& /*uri*/, std::unique_ptr<EventListener>* guard,
+         std::string* /* errmsg */) {
+        guard->reset(new OnFileDeletionListener());
+        return guard->get();
+      });
+  library.Register<EventListener>(
+      FlushCounterListener::kClassName(),
+      [](const std::string& /*uri*/, std::unique_ptr<EventListener>* guard,
+         std::string* /* errmsg */) {
+        guard->reset(new FlushCounterListener());
+        return guard->get();
+      });
+  library.Register<const Comparator>(
+      test::SimpleSuffixReverseComparator::kClassName(),
+      [](const std::string& /*uri*/,
+         std::unique_ptr<const Comparator>* /*guard*/,
+         std::string* /* errmsg */) {
+        static test::SimpleSuffixReverseComparator ssrc;
+        return &ssrc;
+      });
+
   return static_cast<int>(library.GetFactoryCount(&num_types));
 }
 
@@ -1016,6 +1039,7 @@ static int RegisterLocalObjects(ObjectLibrary& library,
       });
   return static_cast<int>(library.GetFactoryCount(&num_types));
 }
+#endif  // !ROCKSDB_LITE
 
 class LoadCustomizableTest : public testing::Test {
  public:
@@ -1086,9 +1110,52 @@ TEST_F(LoadCustomizableTest, LoadSecondaryCacheTest) {
     ASSERT_STREQ(result->Name(), TestSecondaryCache::kClassName());
   }
 }
-#endif  // !ROCKSDB_LITE
+
+TEST_F(LoadCustomizableTest, LoadComparatorTest) {
+  const Comparator* bytewise = BytewiseComparator();
+  const Comparator* reverse = ReverseBytewiseComparator();
+
+  const Comparator* result = nullptr;
+  ASSERT_NOK(Comparator::CreateFromString(
+      config_options_, test::SimpleSuffixReverseComparator::kClassName(),
+      &result));
+  ASSERT_OK(
+      Comparator::CreateFromString(config_options_, bytewise->Name(), &result));
+  ASSERT_EQ(result, bytewise);
+  ASSERT_OK(
+      Comparator::CreateFromString(config_options_, reverse->Name(), &result));
+  ASSERT_EQ(result, reverse);
+
+  if (RegisterTests("Test")) {
+    ASSERT_OK(Comparator::CreateFromString(
+        config_options_, test::SimpleSuffixReverseComparator::kClassName(),
+        &result));
+    ASSERT_NE(result, nullptr);
+    ASSERT_STREQ(result->Name(),
+                 test::SimpleSuffixReverseComparator::kClassName());
+  }
+}
 
 #ifndef ROCKSDB_LITE
+TEST_F(LoadCustomizableTest, LoadEventListenerTest) {
+  std::shared_ptr<EventListener> result;
+
+  ASSERT_NOK(EventListener::CreateFromString(
+      config_options_, OnFileDeletionListener::kClassName(), &result));
+  ASSERT_NOK(EventListener::CreateFromString(
+      config_options_, FlushCounterListener::kClassName(), &result));
+  if (RegisterTests("Test")) {
+    ASSERT_OK(EventListener::CreateFromString(
+        config_options_, OnFileDeletionListener::kClassName(), &result));
+    ASSERT_NE(result, nullptr);
+    ASSERT_STREQ(result->Name(), OnFileDeletionListener::kClassName());
+    ASSERT_OK(EventListener::CreateFromString(
+        config_options_, FlushCounterListener::kClassName(), &result));
+    ASSERT_NE(result, nullptr);
+    ASSERT_STREQ(result->Name(), FlushCounterListener::kClassName());
+  }
+}
+
 TEST_F(LoadCustomizableTest, LoadEncryptionProviderTest) {
   std::shared_ptr<EncryptionProvider> result;
   ASSERT_NOK(
