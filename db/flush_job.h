@@ -19,13 +19,13 @@
 
 #include "db/blob/blob_file_completion_callback.h"
 #include "db/column_family.h"
-#include "db/dbformat.h"
 #include "db/flush_scheduler.h"
 #include "db/internal_stats.h"
 #include "db/job_context.h"
 #include "db/log_writer.h"
 #include "db/logs_with_prep_tracker.h"
 #include "db/memtable_list.h"
+#include "db/seqno_to_time_mapping.h"
 #include "db/snapshot_impl.h"
 #include "db/version_edit.h"
 #include "db/write_controller.h"
@@ -73,6 +73,7 @@ class FlushJob {
            EventLogger* event_logger, bool measure_io_stats,
            const bool sync_output_directory, const bool write_manifest,
            Env::Priority thread_pri, const std::shared_ptr<IOTracer>& io_tracer,
+           const SeqnoToTimeMapping& seq_time_mapping,
            const std::string& db_id = "", const std::string& db_session_id = "",
            std::string full_history_ts_low = "",
            BlobFileCompletionCallback* blob_callback = nullptr);
@@ -83,7 +84,8 @@ class FlushJob {
   // Once PickMemTable() is called, either Run() or Cancel() has to be called.
   void PickMemTable();
   Status Run(LogsWithPrepTracker* prep_tracker = nullptr,
-             FileMetaData* file_meta = nullptr);
+             FileMetaData* file_meta = nullptr,
+             bool* switched_to_mempurge = nullptr);
   void Cancel();
   const autovector<MemTable*>& GetMemTables() const { return mems_; }
 
@@ -93,10 +95,9 @@ class FlushJob {
   }
 #endif  // !ROCKSDB_LITE
 
-  // Return the IO status
-  IOStatus io_status() const { return io_status_; }
-
  private:
+  friend class FlushJobTest_GetRateLimiterPriorityForWrite_Test;
+
   void ReportStartedFlush();
   void ReportFlushInputSize(const autovector<MemTable*>& mems);
   void RecordFlushIOStats();
@@ -117,13 +118,15 @@ class FlushJob {
   // of development. At the moment it is only compatible with the Get, Put,
   // Delete operations as well as Iterators and CompactionFilters.
   // For this early version, "MemPurge" is called by setting the
-  // options.experimental_allow_mempurge flag as "true". When this is
+  // options.experimental_mempurge_threshold value as >0.0. When this is
   // the case, ALL automatic flush operations (kWRiteBufferManagerFull) will
-  // first go through the MemPurge process. herefore, we strongly
+  // first go through the MemPurge process. Therefore, we strongly
   // recommend all users not to set this flag as true given that the MemPurge
   // process has not matured yet.
   Status MemPurge();
-  bool MemPurgeDecider();
+  bool MemPurgeDecider(double threshold);
+  // The rate limiter priority (io_priority) is determined dynamically here.
+  Env::IOPriority GetRateLimiterPriorityForWrite();
 #ifndef ROCKSDB_LITE
   std::unique_ptr<FlushJobInfo> GetFlushJobInfo() const;
 #endif  // !ROCKSDB_LITE
@@ -184,7 +187,6 @@ class FlushJob {
   Version* base_;
   bool pick_memtable_called;
   Env::Priority thread_pri_;
-  IOStatus io_status_;
 
   const std::shared_ptr<IOTracer> io_tracer_;
   SystemClock* clock_;
@@ -192,8 +194,10 @@ class FlushJob {
   const std::string full_history_ts_low_;
   BlobFileCompletionCallback* blob_callback_;
 
-  // Used when experimental_allow_mempurge set to true.
-  bool contains_mempurge_outcome_;
+  // reference to the seqno_time_mapping_ in db_impl.h, not safe to read without
+  // db mutex
+  const SeqnoToTimeMapping& db_impl_seqno_time_mapping_;
+  SeqnoToTimeMapping seqno_to_time_mapping_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

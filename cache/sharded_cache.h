@@ -34,13 +34,14 @@ class CacheShard {
   virtual Cache::Handle* Lookup(const Slice& key, uint32_t hash,
                                 const Cache::CacheItemHelper* helper,
                                 const Cache::CreateCallback& create_cb,
-                                Cache::Priority priority, bool wait) = 0;
+                                Cache::Priority priority, bool wait,
+                                Statistics* stats) = 0;
   virtual bool Release(Cache::Handle* handle, bool useful,
-                       bool force_erase) = 0;
+                       bool erase_if_last_ref) = 0;
   virtual bool IsReady(Cache::Handle* handle) = 0;
   virtual void Wait(Cache::Handle* handle) = 0;
   virtual bool Ref(Cache::Handle* handle) = 0;
-  virtual bool Release(Cache::Handle* handle, bool force_erase) = 0;
+  virtual bool Release(Cache::Handle* handle, bool erase_if_last_ref) = 0;
   virtual void Erase(const Slice& key, uint32_t hash) = 0;
   virtual void SetCapacity(size_t capacity) = 0;
   virtual void SetStrictCapacityLimit(bool strict_capacity_limit) = 0;
@@ -85,7 +86,7 @@ class ShardedCache : public Cache {
                         DeleterFn deleter, Handle** handle,
                         Priority priority) override;
   virtual Status Insert(const Slice& key, void* value,
-                        const CacheItemHelper* helper, size_t chargge,
+                        const CacheItemHelper* helper, size_t charge,
                         Handle** handle = nullptr,
                         Priority priority = Priority::LOW) override;
   virtual Handle* Lookup(const Slice& key, Statistics* stats) override;
@@ -93,11 +94,11 @@ class ShardedCache : public Cache {
                          const CreateCallback& create_cb, Priority priority,
                          bool wait, Statistics* stats = nullptr) override;
   virtual bool Release(Handle* handle, bool useful,
-                       bool force_erase = false) override;
+                       bool erase_if_last_ref = false) override;
   virtual bool IsReady(Handle* handle) override;
   virtual void Wait(Handle* handle) override;
   virtual bool Ref(Handle* handle) override;
-  virtual bool Release(Handle* handle, bool force_erase = false) override;
+  virtual bool Release(Handle* handle, bool erase_if_last_ref = false) override;
   virtual void Erase(const Slice& key) override;
   virtual uint64_t NewId() override;
   virtual size_t GetCapacity() const override;

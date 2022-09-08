@@ -27,6 +27,7 @@
 #include <memory>
 #include <string>
 
+#include "rocksdb/compression_type.h"
 #include "rocksdb/memory_allocator.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/statistics.h"
@@ -51,9 +52,8 @@ struct LRUCacheOptions {
   // Capacity of the cache.
   size_t capacity = 0;
 
-  // Cache is sharded into 2^num_shard_bits shards,
-  // by hash of key. Refer to NewLRUCache for further
-  // information.
+  // Cache is sharded into 2^num_shard_bits shards, by hash of key.
+  // Refer to NewLRUCache for further information.
   int num_shard_bits = -1;
 
   // If strict_capacity_limit is set,
@@ -71,6 +71,17 @@ struct LRUCacheOptions {
   // See also
   // BlockBasedTableOptions::cache_index_and_filter_blocks_with_high_priority.
   double high_pri_pool_ratio = 0.5;
+
+  // Percentage of cache reserved for low priority entries.
+  // If greater than zero, the LRU list will be split into a high-pri list, a
+  // low-pri list and a bottom-pri list. High-pri entries will be inserted to
+  // the tail of high-pri list, while low-pri entries will be first inserted to
+  // the low-pri list (the midpoint) and bottom-pri entries will be first
+  // inserted to the bottom-pri list.
+  //
+  //
+  // See also high_pri_pool_ratio.
+  double low_pri_pool_ratio = 0.0;
 
   // If non-nullptr will use this allocator instead of system allocator when
   // allocating memory for cache blocks. Call this method before you start using
@@ -90,7 +101,7 @@ struct LRUCacheOptions {
   CacheMetadataChargePolicy metadata_charge_policy =
       kDefaultCacheMetadataChargePolicy;
 
-  // A SecondaryCache instance to use a the non-volatile tier
+  // A SecondaryCache instance to use a the non-volatile tier.
   std::shared_ptr<SecondaryCache> secondary_cache;
 
   LRUCacheOptions() {}
@@ -99,11 +110,13 @@ struct LRUCacheOptions {
                   std::shared_ptr<MemoryAllocator> _memory_allocator = nullptr,
                   bool _use_adaptive_mutex = kDefaultToAdaptiveMutex,
                   CacheMetadataChargePolicy _metadata_charge_policy =
-                      kDefaultCacheMetadataChargePolicy)
+                      kDefaultCacheMetadataChargePolicy,
+                  double _low_pri_pool_ratio = 0.0)
       : capacity(_capacity),
         num_shard_bits(_num_shard_bits),
         strict_capacity_limit(_strict_capacity_limit),
         high_pri_pool_ratio(_high_pri_pool_ratio),
+        low_pri_pool_ratio(_low_pri_pool_ratio),
         memory_allocator(std::move(_memory_allocator)),
         use_adaptive_mutex(_use_adaptive_mutex),
         metadata_charge_policy(_metadata_charge_policy) {}
@@ -123,18 +136,72 @@ extern std::shared_ptr<Cache> NewLRUCache(
     std::shared_ptr<MemoryAllocator> memory_allocator = nullptr,
     bool use_adaptive_mutex = kDefaultToAdaptiveMutex,
     CacheMetadataChargePolicy metadata_charge_policy =
-        kDefaultCacheMetadataChargePolicy);
+        kDefaultCacheMetadataChargePolicy,
+    double low_pri_pool_ratio = 0.0);
 
 extern std::shared_ptr<Cache> NewLRUCache(const LRUCacheOptions& cache_opts);
 
-// Similar to NewLRUCache, but create a cache based on CLOCK algorithm with
+// EXPERIMENTAL
+// Options structure for configuring a SecondaryCache instance based on
+// LRUCache. The LRUCacheOptions.secondary_cache is not used and
+// should not be set.
+struct CompressedSecondaryCacheOptions : LRUCacheOptions {
+  // The compression method (if any) that is used to compress data.
+  CompressionType compression_type = CompressionType::kLZ4Compression;
+
+  // compress_format_version can have two values:
+  // compress_format_version == 1 -- decompressed size is not included in the
+  // block header.
+  // compress_format_version == 2 -- decompressed size is included in the block
+  // header in varint32 format.
+  uint32_t compress_format_version = 2;
+
+  CompressedSecondaryCacheOptions() {}
+  CompressedSecondaryCacheOptions(
+      size_t _capacity, int _num_shard_bits, bool _strict_capacity_limit,
+      double _high_pri_pool_ratio, double _low_pri_pool_ratio = 0.0,
+      std::shared_ptr<MemoryAllocator> _memory_allocator = nullptr,
+      bool _use_adaptive_mutex = kDefaultToAdaptiveMutex,
+      CacheMetadataChargePolicy _metadata_charge_policy =
+          kDefaultCacheMetadataChargePolicy,
+      CompressionType _compression_type = CompressionType::kLZ4Compression,
+      uint32_t _compress_format_version = 2)
+      : LRUCacheOptions(_capacity, _num_shard_bits, _strict_capacity_limit,
+                        _high_pri_pool_ratio, std::move(_memory_allocator),
+                        _use_adaptive_mutex, _metadata_charge_policy,
+                        _low_pri_pool_ratio),
+        compression_type(_compression_type),
+        compress_format_version(_compress_format_version) {}
+};
+
+// EXPERIMENTAL
+// Create a new Secondary Cache that is implemented on top of LRUCache.
+extern std::shared_ptr<SecondaryCache> NewCompressedSecondaryCache(
+    size_t capacity, int num_shard_bits = -1,
+    bool strict_capacity_limit = false, double high_pri_pool_ratio = 0.5,
+    double low_pri_pool_ratio = 0.0,
+    std::shared_ptr<MemoryAllocator> memory_allocator = nullptr,
+    bool use_adaptive_mutex = kDefaultToAdaptiveMutex,
+    CacheMetadataChargePolicy metadata_charge_policy =
+        kDefaultCacheMetadataChargePolicy,
+    CompressionType compression_type = CompressionType::kLZ4Compression,
+    uint32_t compress_format_version = 2);
+
+extern std::shared_ptr<SecondaryCache> NewCompressedSecondaryCache(
+    const CompressedSecondaryCacheOptions& opts);
+
+// EXPERIMENTAL Currently ClockCache is under development, although it's
+// already exposed in the public API. To avoid unreliable performance and
+// correctness issues, NewClockCache will temporarily return an LRUCache
+// constructed with the corresponding arguments.
+//
+// TODO(Guido) When ClockCache is complete, roll back to the old text:
+// ``
+// Similar to NewLRUCache, but create a cache based on clock algorithm with
 // better concurrent performance in some cases. See util/clock_cache.cc for
 // more detail.
-//
 // Return nullptr if it is not supported.
-//
-// BROKEN: ClockCache is known to have bugs that could lead to crash or
-// corruption, so should not be used until fixed. Use NewLRUCache instead.
+// ``
 extern std::shared_ptr<Cache> NewClockCache(
     size_t capacity, int num_shard_bits = -1,
     bool strict_capacity_limit = false,
@@ -145,7 +212,17 @@ class Cache {
  public:
   // Depending on implementation, cache entries with high priority could be less
   // likely to get evicted than low priority entries.
-  enum class Priority { HIGH, LOW };
+  //
+  // The BOTTOM priority is mainly used for blob caching. Blobs are typically
+  // lower-value targets for caching than data blocks, since 1) with BlobDB,
+  // data blocks containing blob references conceptually form an index structure
+  // which has to be consulted before we can read the blob value, and 2) cached
+  // blobs represent only a single key-value, while cached data blocks generally
+  // contain multiple KVs. Since we would like to make it possible to use the
+  // same backing cache for the block cache and the blob cache, it would make
+  // sense to add a new, bottom cache priority level for blobs so data blocks
+  // are prioritized over them.
+  enum class Priority { HIGH, LOW, BOTTOM };
 
   // A set of callbacks to allow objects in the primary block cache to be
   // be persisted in a secondary cache. The purpose of the secondary cache
@@ -170,6 +247,10 @@ class Cache {
   // The SizeCallback takes a void* pointer to the object and returns the size
   // of the persistable data. It can be used by the secondary cache to allocate
   // memory if needed.
+  //
+  // RocksDB callbacks are NOT exception-safe. A callback completing with an
+  // exception can lead to undefined behavior in RocksDB, including data loss,
+  // unreported corruption, deadlocks, and more.
   using SizeCallback = size_t (*)(void* obj);
 
   // The SaveToCallback takes a void* object pointer and saves the persistable
@@ -202,10 +283,7 @@ class Cache {
   // takes in a buffer from the NVM cache and constructs an object using
   // it. The callback doesn't have ownership of the buffer and should
   // copy the contents into its own buffer.
-  // typedef std::function<Status(void* buf, size_t size, void** out_obj,
-  //                             size_t* charge)>
-  //    CreateCallback;
-  using CreateCallback = std::function<Status(void* buf, size_t size,
+  using CreateCallback = std::function<Status(const void* buf, size_t size,
                                               void** out_obj, size_t* charge)>;
 
   Cache(std::shared_ptr<MemoryAllocator> allocator = nullptr)
@@ -242,9 +320,9 @@ class Cache {
   virtual const char* Name() const = 0;
 
   // Insert a mapping from key->value into the volatile cache only
-  // and assign it // the specified charge against the total cache capacity.
+  // and assign it with the specified charge against the total cache capacity.
   // If strict_capacity_limit is true and cache reaches its full capacity,
-  // return Status::Incomplete.
+  // return Status::MemoryLimit.
   //
   // If handle is not nullptr, returns a handle that corresponds to the
   // mapping. The caller must call this->Release(handle) when the returned
@@ -279,17 +357,16 @@ class Cache {
 
   /**
    * Release a mapping returned by a previous Lookup(). A released entry might
-   * still  remain in cache in case it is later looked up by others. If
-   * force_erase is set then it also erase it from the cache if there is no
-   * other reference to  it. Erasing it should call the deleter function that
-   * was provided when the
-   * entry was inserted.
+   * still remain in cache in case it is later looked up by others. If
+   * erase_if_last_ref is set then it also erases it from the cache if there is
+   * no other reference to  it. Erasing it should call the deleter function that
+   * was provided when the entry was inserted.
    *
    * Returns true if the entry was also erased.
    */
   // REQUIRES: handle must not have been released yet.
   // REQUIRES: handle must have been returned by a method on *this.
-  virtual bool Release(Handle* handle, bool force_erase = false) = 0;
+  virtual bool Release(Handle* handle, bool erase_if_last_ref = false) = 0;
 
   // Return the value encapsulated in a handle returned by a
   // successful Lookup().
@@ -297,7 +374,7 @@ class Cache {
   // REQUIRES: handle must have been returned by a method on *this.
   virtual void* Value(Handle* handle) = 0;
 
-  // If the cache contains entry for key, erase it.  Note that the
+  // If the cache contains the entry for the key, erase it.  Note that the
   // underlying entry will be kept around until all existing handles
   // to it have been released.
   virtual void Erase(const Slice& key) = 0;
@@ -321,19 +398,19 @@ class Cache {
   // full capacity.
   virtual bool HasStrictCapacityLimit() const = 0;
 
-  // returns the maximum configured capacity of the cache
+  // Returns the maximum configured capacity of the cache
   virtual size_t GetCapacity() const = 0;
 
-  // returns the memory size for the entries residing in the cache.
+  // Returns the memory size for the entries residing in the cache.
   virtual size_t GetUsage() const = 0;
 
-  // returns the memory size for a specific entry in the cache.
+  // Returns the memory size for a specific entry in the cache.
   virtual size_t GetUsage(Handle* handle) const = 0;
 
-  // returns the memory size for the entries in use by the system
+  // Returns the memory size for the entries in use by the system
   virtual size_t GetPinnedUsage() const = 0;
 
-  // returns the charge for the specific entry in the cache.
+  // Returns the charge for the specific entry in the cache.
   virtual size_t GetCharge(Handle* handle) const = 0;
 
   // Returns the deleter for the specified entry. This might seem useless
@@ -347,8 +424,8 @@ class Cache {
   // memory - call this only if you're shutting down the process.
   // Any attempts of using cache after this call will fail terribly.
   // Always delete the DB object before calling this method!
-  virtual void DisownData(){
-      // default implementation is noop
+  virtual void DisownData() {
+    // default implementation is noop
   }
 
   struct ApplyToAllEntriesOptions {
@@ -392,9 +469,8 @@ class Cache {
   // The Insert and Lookup APIs below are intended to allow cached objects
   // to be demoted/promoted between the primary block cache and a secondary
   // cache. The secondary cache could be a non-volatile cache, and will
-  // likely store the object in a different representation more suitable
-  // for on disk storage. They rely on a per object CacheItemHelper to do
-  // the conversions.
+  // likely store the object in a different representation. They rely on a
+  // per object CacheItemHelper to do the conversions.
   // The secondary cache may persist across process and system restarts,
   // and may even be moved between hosts. Therefore, the cache key must
   // be repeatable across restarts/reboots, and globally unique if
@@ -404,7 +480,7 @@ class Cache {
   // Insert a mapping from key->value into the cache and assign it
   // the specified charge against the total cache capacity.
   // If strict_capacity_limit is true and cache reaches its full capacity,
-  // return Status::Incomplete.
+  // return Status::MemoryLimit.
   //
   // The helper argument is saved by the cache and will be used when the
   // inserted object is evicted or promoted to the secondary cache. It,
@@ -468,8 +544,9 @@ class Cache {
   // parameter specifies whether the data was actually used or not,
   // which may be used by the cache implementation to decide whether
   // to consider it as a hit for retention purposes.
-  virtual bool Release(Handle* handle, bool /*useful*/, bool force_erase) {
-    return Release(handle, force_erase);
+  virtual bool Release(Handle* handle, bool /*useful*/,
+                       bool erase_if_last_ref) {
+    return Release(handle, erase_if_last_ref);
   }
 
   // Determines if the handle returned by Lookup() has a valid value yet. The
@@ -491,6 +568,66 @@ class Cache {
 
  private:
   std::shared_ptr<MemoryAllocator> memory_allocator_;
+};
+
+// Classifications of block cache entries.
+//
+// Developer notes: Adding a new enum to this class requires corresponding
+// updates to `kCacheEntryRoleToCamelString` and
+// `kCacheEntryRoleToHyphenString`. Do not add to this enum after `kMisc` since
+// `kNumCacheEntryRoles` assumes `kMisc` comes last.
+enum class CacheEntryRole {
+  // Block-based table data block
+  kDataBlock,
+  // Block-based table filter block (full or partitioned)
+  kFilterBlock,
+  // Block-based table metadata block for partitioned filter
+  kFilterMetaBlock,
+  // OBSOLETE / DEPRECATED: old/removed block-based filter
+  kDeprecatedFilterBlock,
+  // Block-based table index block
+  kIndexBlock,
+  // Other kinds of block-based table block
+  kOtherBlock,
+  // WriteBufferManager's charge to account for its memtable usage
+  kWriteBuffer,
+  // Compression dictionary building buffer's charge to account for
+  // its memory usage
+  kCompressionDictionaryBuildingBuffer,
+  // Filter's charge to account for
+  // (new) bloom and ribbon filter construction's memory usage
+  kFilterConstruction,
+  // BlockBasedTableReader's charge to account for its memory usage
+  kBlockBasedTableReader,
+  // FileMetadata's charge to account for its memory usage
+  kFileMetadata,
+  // Blob value (when using the same cache as block cache and blob cache)
+  kBlobValue,
+  // Blob cache's charge to account for its memory usage (when using a
+  // separate block cache and blob cache)
+  kBlobCache,
+  // Default bucket, for miscellaneous cache entries. Do not use for
+  // entries that could potentially add up to large usage.
+  kMisc,
+};
+constexpr uint32_t kNumCacheEntryRoles =
+    static_cast<uint32_t>(CacheEntryRole::kMisc) + 1;
+
+// Obtain a hyphen-separated, lowercase name of a `CacheEntryRole`.
+const std::string& GetCacheEntryRoleName(CacheEntryRole);
+
+// For use with `GetMapProperty()` for property
+// `DB::Properties::kBlockCacheEntryStats`. On success, the map will
+// be populated with all keys that can be obtained from these functions.
+struct BlockCacheEntryStatsMapKeys {
+  static const std::string& CacheId();
+  static const std::string& CacheCapacityBytes();
+  static const std::string& LastCollectionDurationSeconds();
+  static const std::string& LastCollectionAgeSeconds();
+
+  static std::string EntryCount(CacheEntryRole);
+  static std::string UsedBytes(CacheEntryRole);
+  static std::string UsedPercent(CacheEntryRole);
 };
 
 }  // namespace ROCKSDB_NAMESPACE

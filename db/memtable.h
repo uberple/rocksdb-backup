@@ -13,7 +13,7 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "db/dbformat.h"
@@ -30,6 +30,7 @@
 #include "table/multiget_context.h"
 #include "util/dynamic_bloom.h"
 #include "util/hash.h"
+#include "util/hash_containers.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -57,6 +58,7 @@ struct ImmutableMemTableOptions {
   MergeOperator* merge_operator;
   Logger* info_log;
   bool allow_data_in_errors;
+  uint32_t protection_bytes_per_key;
 };
 
 // Batched counters to updated when inserting keys in one write batch.
@@ -145,6 +147,33 @@ class MemTable {
     return approximate_memory_usage_.load(std::memory_order_relaxed);
   }
 
+  // used by MemTableListVersion::MemoryAllocatedBytesExcludingLast
+  size_t MemoryAllocatedBytes() const {
+    return table_->ApproximateMemoryUsage() +
+           range_del_table_->ApproximateMemoryUsage() +
+           arena_.MemoryAllocatedBytes();
+  }
+
+  // Returns a vector of unique random memtable entries of size 'sample_size'.
+  //
+  // Note: the entries are stored in the unordered_set as length-prefixed keys,
+  //       hence their representation in the set as "const char*".
+  // Note2: the size of the output set 'entries' is not enforced to be strictly
+  //        equal to 'target_sample_size'. Its final size might be slightly
+  //        greater or slightly less than 'target_sample_size'
+  //
+  // REQUIRES: external synchronization to prevent simultaneous
+  // operations on the same MemTable (unless this Memtable is immutable).
+  // REQUIRES: SkipList memtable representation. This function is not
+  // implemented for any other type of memtable representation (vectorrep,
+  // hashskiplist,...).
+  void UniqueRandomSample(const uint64_t& target_sample_size,
+                          std::unordered_set<const char*>* entries) {
+    // TODO(bjlemaire): at the moment, only supported by skiplistrep.
+    // Extend it to all other memtable representations.
+    table_->UniqueRandomSample(num_entries(), target_sample_size, entries);
+  }
+
   // This method heuristically determines if the memtable should continue to
   // host more data.
   bool ShouldScheduleFlush() const {
@@ -174,11 +203,22 @@ class MemTable {
   //        those allocated in arena.
   InternalIterator* NewIterator(const ReadOptions& read_options, Arena* arena);
 
+  // Returns an iterator that yields the range tombstones of the memtable.
+  // The caller must ensure that the underlying MemTable remains live
+  // while the returned iterator is live.
+  // @param immutable_memtable Whether this memtable is an immutable memtable.
+  // This information is not stored in memtable itself, so it needs to be
+  // specified by the caller. This flag is used internally to decide whether a
+  // cached fragmented range tombstone list can be returned. This cached version
+  // is constructed when a memtable becomes immutable. Setting the flag to false
+  // will always yield correct result, but may incur performance penalty as it
+  // always creates a new fragmented range tombstone list.
   FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(
-      const ReadOptions& read_options, SequenceNumber read_seq);
+      const ReadOptions& read_options, SequenceNumber read_seq,
+      bool immutable_memtable);
 
   Status VerifyEncodedEntry(Slice encoded,
-                            const ProtectionInfoKVOTS64& kv_prot_info);
+                            const ProtectionInfoKVOS64& kv_prot_info);
 
   // Add an entry into memtable that maps key to value at the
   // specified sequence number and with the specified type.
@@ -191,7 +231,7 @@ class MemTable {
   // in the memtable and `MemTableRepFactory::CanHandleDuplicatedKey()` is true.
   // The next attempt should try a larger value for `seq`.
   Status Add(SequenceNumber seq, ValueType type, const Slice& key,
-             const Slice& value, const ProtectionInfoKVOTS64* kv_prot_info,
+             const Slice& value, const ProtectionInfoKVOS64* kv_prot_info,
              bool allow_concurrent = false,
              MemTablePostProcessInfo* post_process_info = nullptr,
              void** hint = nullptr);
@@ -216,37 +256,37 @@ class MemTable {
   // If do_merge = false then any Merge Operands encountered for key are simply
   // stored in merge_context.operands_list and never actually merged to get a
   // final value. The raw Merge Operands are eventually returned to the user.
-  bool Get(const LookupKey& key, std::string* value, Status* s,
+  // @param immutable_memtable Whether this memtable is immutable. Used
+  // internally by NewRangeTombstoneIterator(). See comment above
+  // NewRangeTombstoneIterator() for more detail.
+  bool Get(const LookupKey& key, std::string* value,
+           PinnableWideColumns* columns, std::string* timestamp, Status* s,
            MergeContext* merge_context,
            SequenceNumber* max_covering_tombstone_seq, SequenceNumber* seq,
-           const ReadOptions& read_opts, ReadCallback* callback = nullptr,
-           bool* is_blob_index = nullptr, bool do_merge = true) {
-    return Get(key, value, /*timestamp=*/nullptr, s, merge_context,
-               max_covering_tombstone_seq, seq, read_opts, callback,
-               is_blob_index, do_merge);
-  }
+           const ReadOptions& read_opts, bool immutable_memtable,
+           ReadCallback* callback = nullptr, bool* is_blob_index = nullptr,
+           bool do_merge = true);
 
-  bool Get(const LookupKey& key, std::string* value, std::string* timestamp,
-           Status* s, MergeContext* merge_context,
-           SequenceNumber* max_covering_tombstone_seq, SequenceNumber* seq,
-           const ReadOptions& read_opts, ReadCallback* callback = nullptr,
-           bool* is_blob_index = nullptr, bool do_merge = true);
-
-  bool Get(const LookupKey& key, std::string* value, std::string* timestamp,
-           Status* s, MergeContext* merge_context,
+  bool Get(const LookupKey& key, std::string* value,
+           PinnableWideColumns* columns, std::string* timestamp, Status* s,
+           MergeContext* merge_context,
            SequenceNumber* max_covering_tombstone_seq,
-           const ReadOptions& read_opts, ReadCallback* callback = nullptr,
-           bool* is_blob_index = nullptr, bool do_merge = true) {
+           const ReadOptions& read_opts, bool immutable_memtable,
+           ReadCallback* callback = nullptr, bool* is_blob_index = nullptr,
+           bool do_merge = true) {
     SequenceNumber seq;
-    return Get(key, value, timestamp, s, merge_context,
-               max_covering_tombstone_seq, &seq, read_opts, callback,
-               is_blob_index, do_merge);
+    return Get(key, value, columns, timestamp, s, merge_context,
+               max_covering_tombstone_seq, &seq, read_opts, immutable_memtable,
+               callback, is_blob_index, do_merge);
   }
 
+  // @param immutable_memtable Whether this memtable is immutable. Used
+  // internally by NewRangeTombstoneIterator(). See comment above
+  // NewRangeTombstoneIterator() for more detail.
   void MultiGet(const ReadOptions& read_options, MultiGetRange* range,
-                ReadCallback* callback);
+                ReadCallback* callback, bool immutable_memtable);
 
-  // If `key` exists in current memtable with type `kTypeValue` and the existing
+  // If `key` exists in current memtable with type value_type and the existing
   // value is at least as large as the new value, updates it in-place. Otherwise
   // adds the new value to the memtable out-of-place.
   //
@@ -256,8 +296,8 @@ class MemTable {
   //
   // REQUIRES: external synchronization to prevent simultaneous
   // operations on the same MemTable.
-  Status Update(SequenceNumber seq, const Slice& key, const Slice& value,
-                const ProtectionInfoKVOTS64* kv_prot_info);
+  Status Update(SequenceNumber seq, ValueType value_type, const Slice& key,
+                const Slice& value, const ProtectionInfoKVOS64* kv_prot_info);
 
   // If `key` exists in current memtable with type `kTypeValue` and the existing
   // value is at least as large as the new value, updates it in-place. Otherwise
@@ -275,7 +315,7 @@ class MemTable {
   // operations on the same MemTable.
   Status UpdateCallback(SequenceNumber seq, const Slice& key,
                         const Slice& delta,
-                        const ProtectionInfoKVOTS64* kv_prot_info);
+                        const ProtectionInfoKVOS64* kv_prot_info);
 
   // Returns the number of successive merge entries starting from the newest
   // entry for the key up to the last non-merge entry or last entry for the
@@ -474,6 +514,28 @@ class MemTable {
   // Returns a heuristic flush decision
   bool ShouldFlushNow();
 
+  void ConstructFragmentedRangeTombstones();
+
+  // Returns whether a fragmented range tombstone list is already constructed
+  // for this memtable. It should be constructed right before a memtable is
+  // added to an immutable memtable list. Note that if a memtable does not have
+  // any range tombstone, then no range tombstone list will ever be constructed.
+  // @param allow_empty Specifies whether a memtable with no range tombstone is
+  // considered to have its fragmented range tombstone list constructed.
+  bool IsFragmentedRangeTombstonesConstructed(bool allow_empty = true) const {
+    if (allow_empty) {
+      return fragmented_range_tombstone_list_.get() != nullptr ||
+             is_range_del_table_empty_;
+    } else {
+      return fragmented_range_tombstone_list_.get() != nullptr;
+    }
+  }
+
+  // Returns Corruption status if verification fails.
+  static Status VerifyEntryChecksum(const char* entry,
+                                    size_t protection_bytes_per_key,
+                                    bool allow_data_in_errors = false);
+
  private:
   enum FlushStateEnum { FLUSH_NOT_REQUESTED, FLUSH_REQUESTED, FLUSH_SCHEDULED };
 
@@ -538,7 +600,7 @@ class MemTable {
   const SliceTransform* insert_with_hint_prefix_extractor_;
 
   // Insert hints for each prefix.
-  std::unordered_map<Slice, void*, SliceHasher> insert_hints_;
+  UnorderedMapH<Slice, void*, SliceHasher> insert_hints_;
 
   // Timestamp of oldest key
   std::atomic<uint64_t> oldest_key_time_;
@@ -569,9 +631,27 @@ class MemTable {
   void GetFromTable(const LookupKey& key,
                     SequenceNumber max_covering_tombstone_seq, bool do_merge,
                     ReadCallback* callback, bool* is_blob_index,
-                    std::string* value, std::string* timestamp, Status* s,
+                    std::string* value, PinnableWideColumns* columns,
+                    std::string* timestamp, Status* s,
                     MergeContext* merge_context, SequenceNumber* seq,
                     bool* found_final_value, bool* merge_in_progress);
+
+  // Always returns non-null and assumes certain pre-checks (e.g.,
+  // is_range_del_table_empty_) are done. This is only valid during the lifetime
+  // of the underlying memtable.
+  FragmentedRangeTombstoneIterator* NewRangeTombstoneIteratorInternal(
+      const ReadOptions& read_options, SequenceNumber read_seq,
+      bool immutable_memtable);
+
+  // The fragmented range tombstones of this memtable.
+  // This is constructed when this memtable becomes immutable
+  // if !is_range_del_table_empty_.
+  std::unique_ptr<FragmentedRangeTombstoneList>
+      fragmented_range_tombstone_list_;
+
+  void UpdateEntryChecksum(const ProtectionInfoKVOS64* kv_prot_info,
+                           const Slice& key, const Slice& value, ValueType type,
+                           SequenceNumber s, char* checksum_ptr);
 };
 
 extern const char* EncodeKey(std::string* scratch, const Slice& target);

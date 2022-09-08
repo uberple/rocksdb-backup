@@ -17,8 +17,6 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-Configurable::Configurable() : is_prepared_(false) {}
-
 void Configurable::RegisterOptions(
     const std::string& name, void* opt_ptr,
     const std::unordered_map<std::string, OptionTypeInfo>* type_map) {
@@ -45,21 +43,13 @@ Status Configurable::PrepareOptions(const ConfigOptions& opts) {
   Status status = Status::OK();
 #ifndef ROCKSDB_LITE
   for (auto opt_iter : options_) {
-    for (auto map_iter : *(opt_iter.type_map)) {
-      auto& opt_info = map_iter.second;
-      if (!opt_info.IsDeprecated() && !opt_info.IsAlias() &&
-          opt_info.IsConfigurable()) {
-        if (!opt_info.IsEnabled(OptionTypeFlags::kDontPrepare)) {
-          Configurable* config =
-              opt_info.AsRawPointer<Configurable>(opt_iter.opt_ptr);
-          if (config != nullptr) {
-            status = config->PrepareOptions(opts);
-            if (!status.ok()) {
-              return status;
-            }
-          } else if (!opt_info.CanBeNull()) {
-            status =
-                Status::NotFound("Missing configurable object", map_iter.first);
+    if (opt_iter.type_map != nullptr) {
+      for (auto map_iter : *(opt_iter.type_map)) {
+        auto& opt_info = map_iter.second;
+        if (opt_info.ShouldPrepare()) {
+          status = opt_info.Prepare(opts, map_iter.first, opt_iter.opt_ptr);
+          if (!status.ok()) {
+            return status;
           }
         }
       }
@@ -68,9 +58,6 @@ Status Configurable::PrepareOptions(const ConfigOptions& opts) {
 #else
   (void)opts;
 #endif  // ROCKSDB_LITE
-  if (status.ok()) {
-    is_prepared_ = true;
-  }
   return status;
 }
 
@@ -79,18 +66,12 @@ Status Configurable::ValidateOptions(const DBOptions& db_opts,
   Status status;
 #ifndef ROCKSDB_LITE
   for (auto opt_iter : options_) {
-    for (auto map_iter : *(opt_iter.type_map)) {
-      auto& opt_info = map_iter.second;
-      if (!opt_info.IsDeprecated() && !opt_info.IsAlias()) {
-        if (opt_info.IsConfigurable()) {
-          const Configurable* config =
-              opt_info.AsRawPointer<Configurable>(opt_iter.opt_ptr);
-          if (config != nullptr) {
-            status = config->ValidateOptions(db_opts, cf_opts);
-          } else if (!opt_info.CanBeNull()) {
-            status =
-                Status::NotFound("Missing configurable object", map_iter.first);
-          }
+    if (opt_iter.type_map != nullptr) {
+      for (auto map_iter : *(opt_iter.type_map)) {
+        auto& opt_info = map_iter.second;
+        if (opt_info.ShouldValidate()) {
+          status = opt_info.Validate(db_opts, cf_opts, map_iter.first,
+                                     opt_iter.opt_ptr);
           if (!status.ok()) {
             return status;
           }
@@ -129,11 +110,13 @@ const OptionTypeInfo* ConfigurableHelper::FindOption(
     const std::vector<Configurable::RegisteredOptions>& options,
     const std::string& short_name, std::string* opt_name, void** opt_ptr) {
   for (auto iter : options) {
-    const auto opt_info =
-        OptionTypeInfo::Find(short_name, *(iter.type_map), opt_name);
-    if (opt_info != nullptr) {
-      *opt_ptr = iter.opt_ptr;
-      return opt_info;
+    if (iter.type_map != nullptr) {
+      const auto opt_info =
+          OptionTypeInfo::Find(short_name, *(iter.type_map), opt_name);
+      if (opt_info != nullptr) {
+        *opt_ptr = iter.opt_ptr;
+        return opt_info;
+      }
     }
   }
   return nullptr;
@@ -285,12 +268,14 @@ Status ConfigurableHelper::ConfigureOptions(
   if (!opts_map.empty()) {
 #ifndef ROCKSDB_LITE
     for (const auto& iter : configurable.options_) {
-      s = ConfigureSomeOptions(config_options, configurable, *(iter.type_map),
-                               &remaining, iter.opt_ptr);
-      if (remaining.empty()) {  // Are there more options left?
-        break;
-      } else if (!s.ok()) {
-        break;
+      if (iter.type_map != nullptr) {
+        s = ConfigureSomeOptions(config_options, configurable, *(iter.type_map),
+                                 &remaining, iter.opt_ptr);
+        if (remaining.empty()) {  // Are there more options left?
+          break;
+        } else if (!s.ok()) {
+          break;
+        }
       }
     }
 #else
@@ -415,8 +400,8 @@ Status ConfigurableHelper::ConfigureCustomizableOption(
 
   if (opt_info.IsMutable() || !config_options.mutable_options_only) {
     // Either the option is mutable, or we are processing all of the options
-    if (opt_name == name || name == ConfigurableHelper::kIdPropName ||
-        EndsWith(opt_name, ConfigurableHelper::kIdPropSuffix)) {
+    if (opt_name == name || name == OptionTypeInfo::kIdPropName() ||
+        EndsWith(opt_name, OptionTypeInfo::kIdPropSuffix())) {
       return configurable.ParseOption(copy, opt_info, name, value, opt_ptr);
     } else if (value.empty()) {
       return Status::OK();
@@ -439,8 +424,8 @@ Status ConfigurableHelper::ConfigureCustomizableOption(
       } else {
         return Status::InvalidArgument("Option not changeable: " + opt_name);
       }
-    } else if (EndsWith(opt_name, ConfigurableHelper::kIdPropSuffix) ||
-               name == ConfigurableHelper::kIdPropName) {
+    } else if (EndsWith(opt_name, OptionTypeInfo::kIdPropSuffix()) ||
+               name == OptionTypeInfo::kIdPropName()) {
       // We have a property of the form "id=value" or "table.id=value"
       // This is OK if we ID/value matches the current customizable object
       if (custom->GetId() == value) {
@@ -459,7 +444,8 @@ Status ConfigurableHelper::ConfigureCustomizableOption(
       // map
       std::unordered_map<std::string, std::string> props;
       std::string id;
-      Status s = GetOptionsMap(value, custom->GetId(), &id, &props);
+      Status s =
+          Configurable::GetOptionsMap(value, custom->GetId(), &id, &props);
       if (!s.ok()) {
         return s;
       } else if (custom->GetId() != id) {
@@ -577,36 +563,38 @@ Status ConfigurableHelper::SerializeOptions(const ConfigOptions& config_options,
                                             std::string* result) {
   assert(result);
   for (auto const& opt_iter : configurable.options_) {
-    for (const auto& map_iter : *(opt_iter.type_map)) {
-      const auto& opt_name = map_iter.first;
-      const auto& opt_info = map_iter.second;
-      if (opt_info.ShouldSerialize()) {
-        std::string value;
-        Status s;
-        if (!config_options.mutable_options_only) {
-          s = opt_info.Serialize(config_options, prefix + opt_name,
-                                 opt_iter.opt_ptr, &value);
-        } else if (opt_info.IsMutable()) {
-          ConfigOptions copy = config_options;
-          copy.mutable_options_only = false;
-          s = opt_info.Serialize(copy, prefix + opt_name, opt_iter.opt_ptr,
-                                 &value);
-        } else if (opt_info.IsConfigurable()) {
-          // If it is a Configurable and we are either printing all of the
-          // details or not printing only the name, this option should be
-          // included in the list
-          if (config_options.IsDetailed() ||
-              !opt_info.IsEnabled(OptionTypeFlags::kStringNameOnly)) {
+    if (opt_iter.type_map != nullptr) {
+      for (const auto& map_iter : *(opt_iter.type_map)) {
+        const auto& opt_name = map_iter.first;
+        const auto& opt_info = map_iter.second;
+        if (opt_info.ShouldSerialize()) {
+          std::string value;
+          Status s;
+          if (!config_options.mutable_options_only) {
             s = opt_info.Serialize(config_options, prefix + opt_name,
                                    opt_iter.opt_ptr, &value);
+          } else if (opt_info.IsMutable()) {
+            ConfigOptions copy = config_options;
+            copy.mutable_options_only = false;
+            s = opt_info.Serialize(copy, prefix + opt_name, opt_iter.opt_ptr,
+                                   &value);
+          } else if (opt_info.IsConfigurable()) {
+            // If it is a Configurable and we are either printing all of the
+            // details or not printing only the name, this option should be
+            // included in the list
+            if (config_options.IsDetailed() ||
+                !opt_info.IsEnabled(OptionTypeFlags::kStringNameOnly)) {
+              s = opt_info.Serialize(config_options, prefix + opt_name,
+                                     opt_iter.opt_ptr, &value);
+            }
           }
-        }
-        if (!s.ok()) {
-          return s;
-        } else if (!value.empty()) {
-          // <prefix><opt_name>=<value><delimiter>
-          result->append(prefix + opt_name + "=" + value +
-                         config_options.delimiter);
+          if (!s.ok()) {
+            return s;
+          } else if (!value.empty()) {
+            // <prefix><opt_name>=<value><delimiter>
+            result->append(prefix + opt_name + "=" + value +
+                           config_options.delimiter);
+          }
         }
       }
     }
@@ -633,16 +621,18 @@ Status ConfigurableHelper::ListOptions(
     const std::string& prefix, std::unordered_set<std::string>* result) {
   Status status;
   for (auto const& opt_iter : configurable.options_) {
-    for (const auto& map_iter : *(opt_iter.type_map)) {
-      const auto& opt_name = map_iter.first;
-      const auto& opt_info = map_iter.second;
-      // If the option is no longer used in rocksdb and marked as deprecated,
-      // we skip it in the serialization.
-      if (!opt_info.IsDeprecated() && !opt_info.IsAlias()) {
-        if (!config_options.mutable_options_only) {
-          result->emplace(prefix + opt_name);
-        } else if (opt_info.IsMutable()) {
-          result->emplace(prefix + opt_name);
+    if (opt_iter.type_map != nullptr) {
+      for (const auto& map_iter : *(opt_iter.type_map)) {
+        const auto& opt_name = map_iter.first;
+        const auto& opt_info = map_iter.second;
+        // If the option is no longer used in rocksdb and marked as deprecated,
+        // we skip it in the serialization.
+        if (!opt_info.IsDeprecated() && !opt_info.IsAlias()) {
+          if (!config_options.mutable_options_only) {
+            result->emplace(prefix + opt_name);
+          } else if (opt_info.IsMutable()) {
+            result->emplace(prefix + opt_name);
+          }
         }
       }
     }
@@ -706,7 +696,7 @@ bool ConfigurableHelper::AreEquivalent(const ConfigOptions& config_options,
     if (this_offset != that_offset) {
       if (this_offset == nullptr || that_offset == nullptr) {
         return false;
-      } else {
+      } else if (o.type_map != nullptr) {
         for (const auto& map_iter : *(o.type_map)) {
           const auto& opt_info = map_iter.second;
           if (config_options.IsCheckEnabled(opt_info.GetSanityLevel())) {
@@ -734,7 +724,7 @@ bool ConfigurableHelper::AreEquivalent(const ConfigOptions& config_options,
 }
 #endif  // ROCKSDB_LITE
 
-Status ConfigurableHelper::GetOptionsMap(
+Status Configurable::GetOptionsMap(
     const std::string& value, const std::string& default_id, std::string* id,
     std::unordered_map<std::string, std::string>* props) {
   assert(id);
@@ -752,10 +742,13 @@ Status ConfigurableHelper::GetOptionsMap(
       props->clear();         // Clear the properties
       status = Status::OK();  // and ignore the error
     } else {
-      auto iter = props->find(ConfigurableHelper::kIdPropName);
+      auto iter = props->find(OptionTypeInfo::kIdPropName());
       if (iter != props->end()) {
         *id = iter->second;
         props->erase(iter);
+        if (*id == kNullptrString) {
+          id->clear();
+        }
       } else if (!default_id.empty()) {
         *id = default_id;
       } else {           // No id property and no default

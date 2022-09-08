@@ -12,7 +12,6 @@
 #include <string>
 #include "db/db_impl/db_impl.h"
 #include "db/db_iter.h"
-#include "db/dbformat.h"
 #include "db/range_del_aggregator.h"
 #include "memory/arena.h"
 #include "options/cf_options.h"
@@ -34,20 +33,28 @@ class Version;
 // the same as the inner DBIter.
 class ArenaWrappedDBIter : public Iterator {
  public:
-  virtual ~ArenaWrappedDBIter() { db_iter_->~DBIter(); }
+  ~ArenaWrappedDBIter() override {
+    if (db_iter_ != nullptr) {
+      db_iter_->~DBIter();
+    } else {
+      assert(false);
+    }
+  }
 
   // Get the arena to be used to allocate memory for DBIter to be wrapped,
   // as well as child iterators in it.
   virtual Arena* GetArena() { return &arena_; }
-  virtual ReadRangeDelAggregator* GetRangeDelAggregator() {
-    return db_iter_->GetRangeDelAggregator();
-  }
+
   const ReadOptions& GetReadOptions() { return read_options_; }
 
   // Set the internal iterator wrapped inside the DB Iterator. Usually it is
   // a merging iterator.
   virtual void SetIterUnderDBIter(InternalIterator* iter) {
     db_iter_->SetIter(iter);
+  }
+
+  void SetMemtableRangetombstoneIter(TruncatedRangeDelIterator** iter) {
+    memtable_range_tombstone_iter_ = iter;
   }
 
   bool Valid() const override { return db_iter_->Valid(); }
@@ -90,7 +97,7 @@ class ArenaWrappedDBIter : public Iterator {
   }
 
  private:
-  DBIter* db_iter_;
+  DBIter* db_iter_ = nullptr;
   Arena arena_;
   uint64_t sv_number_;
   ColumnFamilyData* cfd_ = nullptr;
@@ -99,6 +106,7 @@ class ArenaWrappedDBIter : public Iterator {
   ReadCallback* read_callback_;
   bool expose_blob_index_ = false;
   bool allow_refresh_ = true;
+  TruncatedRangeDelIterator** memtable_range_tombstone_iter_ = nullptr;
 };
 
 // Generate the arena wrapped iterator class.
